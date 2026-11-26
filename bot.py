@@ -24,14 +24,22 @@ from shared import contains_blocked, make_ai_client, is_hateful, ask_ai, giphy_s
 try:
     import nightbot_import
     NIGHTBOT_IMPORT_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    # Nightbot import is optional: a broken nightbot_import.py (e.g. a
+    # bad paste) must not kill the bot — custom commands just stay off.
+    print(f"[nightbot] import failed ({e}) — custom commands disabled",
+          flush=True)
     NIGHTBOT_IMPORT_AVAILABLE = False
 
 try:
     import voice_listen
     import voice_commands
     VOICE_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    # Voice is optional: a broken voice module (bad paste, SyntaxError,
+    # ...) must not kill the bot — voice listening just stays off.
+    print(f"[voice] voice modules failed to import ({e}) — "
+          "voice listening disabled", flush=True)
     VOICE_AVAILABLE = False
 
 try:
@@ -51,7 +59,12 @@ try:
         bridge_post, bridge_get,
     )
     OVERLAY_AVAILABLE = True
-except ImportError:
+except Exception as e:
+    # Overlay is optional: a broken overlay_server/hub (bad paste,
+    # SyntaxError, missing flask, ...) must not kill the bot — overlay
+    # features just stay off.
+    print(f"[overlay] overlay modules failed to import ({e}) — "
+          "overlay features disabled", flush=True)
     OVERLAY_AVAILABLE = False  # pip install flask to enable hub features
 
 # (slur patterns moved to shared.py — imported above)
@@ -69,8 +82,31 @@ DEFAULT_RANDOM_MESSAGES = [
 
 
 def load_config(path="config.yaml"):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    # Resolve relative to this file, not the working directory, so the
+    # bot starts no matter where the launcher runs it from.
+    if not os.path.isabs(path):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    try:
+        with open(path, "r") as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"[config] FATAL: no config.yaml at {path} — copy "
+              "config.example.yaml to config.yaml and fill in your tokens",
+              flush=True)
+        raise
+    except Exception as e:
+        print(f"[config] FATAL: could not read {path} ({e})", flush=True)
+        raise
+
+
+def _require_config_keys(config):
+    """Fail LOUD on missing must-haves instead of a bare KeyError inside
+    GrousBot.__init__ — the console should name the missing key."""
+    for _key in ("twitch_token", "channel"):
+        if not config.get(_key):
+            print(f"[boot] FATAL: config.yaml is missing '{_key}' — the bot "
+                  "cannot connect without it", flush=True)
+            raise SystemExit(2)
 
 
 def ensure_fresh_token(config, config_path="config.yaml"):
@@ -276,15 +312,27 @@ class GrousBot(commands.Bot):
                 print("[nightbot] couldn't load custom_commands.json: %s" % e)
         self._custom_cooldowns = {}  # trigger -> last-used timestamp (Nightbot: global per command)
 
-        # Stream overlay web server for !gif / !photos / arena (OBS browser sources)
+        # Stream overlay web server for !gif / !photos / arena (OBS browser sources).
+        # The overlay is OPTIONAL: if it fails to start (port already in
+        # use, Flask error, ...), the Twitch bot must keep running
+        # degraded instead of dying inside __init__ — overlay-gated
+        # commands already check OVERLAY_AVAILABLE, so switching it off
+        # here degrades them cleanly.
+        global OVERLAY_AVAILABLE
         if OVERLAY_AVAILABLE:
-            port = int(config.get("overlay_port", 5000) or 5000)
-            ensure_overlay(port)
-            hub.configure(port)
-            print(f"[overlay] OBS browser sources: http://localhost:{port}/overlay and /arena")
-            giphy_key = str(config.get("giphy_api_key") or "")
-            if giphy_key and "PASTE" not in giphy_key:
-                set_giphy_key(giphy_key)
+            try:
+                port = int(config.get("overlay_port", 5000) or 5000)
+                ensure_overlay(port)
+                hub.configure(port)
+                print(f"[overlay] OBS browser sources: http://localhost:{port}/overlay and /arena")
+                giphy_key = str(config.get("giphy_api_key") or "")
+                if giphy_key and "PASTE" not in giphy_key:
+                    set_giphy_key(giphy_key)
+            except Exception as e:
+                OVERLAY_AVAILABLE = False
+                print(f"[overlay] FAILED to start overlay server ({e}) — "
+                      "overlay features disabled, Twitch bot continues",
+                      flush=True)
 
     async def event_ready(self):
         print(f"GrousBot connected to #{self.cfg['channel']}")
@@ -1752,5 +1800,21 @@ class GrousBot(commands.Bot):
 if __name__ == "__main__":
     config = load_config()
     config = ensure_fresh_token(config)
+    _require_config_keys(config)
     bot = GrousBot(config)
-    bot.run()
+    try:
+        bot.run()
+    except Exception as e:
+        # A loud one-line diagnosis for the console. The exception is
+        # re-raised so the traceback — and the hellhound's auth sniffing
+        # on the bot's output — still reaches the log unchanged.
+        _detail = f"{type(e).__name__}: {e}".lower()
+        if any(s in _detail for s in ("loginfailure", "authenticationerror",
+                                      "invalid access token", "unauthorized")):
+            print("[twitch] Login failure — Twitch refused the token. "
+                  "Mint a fresh pair and paste the access + refresh tokens "
+                  "into config.yaml, then restart.", flush=True)
+        else:
+            print(f"[twitch] bot exited with error: {type(e).__name__}: {e}",
+                  flush=True)
+        raise
